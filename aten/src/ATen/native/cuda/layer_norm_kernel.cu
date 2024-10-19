@@ -744,7 +744,9 @@ void launch_vectorized_layer_norm_kernel(
     //constexpr int alignment = 16; //currently unused to make sure float and half results are bw accurate
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int warp_size = at::cuda::warp_size();
-    const dim3 threads(warp_size, num_threads() / warp_size, 1);
+    auto n_mod_up = (N + warp_size - 1) / warp_size;
+    const int warp_cnt = num_threads() / warp_size;
+    const dim3 threads(warp_size, warp_cnt < n_mod_up? warp_cnt : n_mod_up, 1);
     const dim3 blocks(M);
     TORCH_INTERNAL_ASSERT_DEBUG_ONLY(threads.y % 2 == 0 || threads.y == 1);
     int nshared = threads.y > 1 ? threads.y * 3/2 *sizeof(T_ACC) : 0;
