@@ -149,6 +149,179 @@ void float8_copy_kernel_cuda(TensorIteratorBase &iter) {
   }
 }
 
+// This API is for detecting whether the permute parameter of a three-dimensional tensor
+// in the Copy operation from src to dst is from [0, 1, 2] to [0, 2, 1].
+bool is_permute_021(TensorIteratorBase &iter) {
+  const auto& input = iter.tensor(1);
+  const auto& output = iter.tensor(0);
+
+
+  bool is_permute = false;
+  if (input.dim() == 3) {
+    is_permute = true;
+    is_permute &= input.dim() == output.dim();
+    is_permute &= input.stride(0) == input.size(2) * input.stride(2);
+    is_permute &= input.stride(1) == 1;
+    is_permute &= input.stride(2) >= input.size(1);
+    is_permute &= output.is_contiguous();
+  }
+  return is_permute;
+}
+
+template<class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K>
+__global__ void transpose_tile_big_kernel(const void* __restrict a, void* __restrict c, const int N, const int K, const int STRIDE_N_ELE)
+{
+    constexpr uint32_t elements_in_16B = 8;
+    union BLOCK_16B
+    {
+        _T e[elements_in_16B];
+        __uint128_t ow;
+    };
+
+
+    constexpr int LDS_PAD = (4 / sizeof(_T));
+    // Round up processing to next full tile
+    const uint32_t n_tiles = (N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N;
+    const uint32_t k_tiles = (K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K;
+    const uint32_t nk_tiles = n_tiles * k_tiles;
+    const uint32_t m = blockIdx.x / 8 / nk_tiles * 8 + blockIdx.x % 8;
+    const uint64_t stride_n = STRIDE_N_ELE * sizeof(_T);
+    const uint64_t stride_k = N * sizeof(_T);
+    const uint64_t out_stride_nk = N * K * sizeof(_T);
+    const uint64_t in_stride_nk = N * STRIDE_N_ELE * sizeof(_T);
+
+    // Walk destination tiles continuously for cache coherency
+    constexpr uint32_t XCD = 8;
+    constexpr uint32_t SEQ = 8;
+    constexpr uint32_t sblk = XCD * SEQ;
+    const uint32_t max_swizzle = (nk_tiles / sblk) * sblk;
+    uint32_t tIdx = blockIdx.x / 8 % nk_tiles;
+    tIdx = tIdx > max_swizzle ? tIdx :
+        (tIdx / sblk) * sblk + (tIdx % sblk) / SEQ + (tIdx % SEQ) * XCD;
+    uint32_t ti = tIdx / k_tiles;
+    uint32_t tj = tIdx % k_tiles;
+
+    __shared__ _T sa[BIG_TILE_SIZE_N][BIG_TILE_SIZE_K + LDS_PAD];
+
+    // Detect partial tiles
+    uint32_t max_part_n = (ti == (n_tiles - 1) && (N % BIG_TILE_SIZE_N) != 0) ? (N % BIG_TILE_SIZE_N) : BIG_TILE_SIZE_N;
+    uint32_t max_part_k = (tj == (k_tiles - 1) && (K % BIG_TILE_SIZE_K) != 0) ? (K % BIG_TILE_SIZE_K) : BIG_TILE_SIZE_K;
+    if (max_part_n % 8 == 0 && max_part_k % 8 == 0)
+    {
+        // Copy full tile with large loads
+        constexpr uint32_t row_bytes = BIG_TILE_SIZE_K * sizeof(_T);
+        constexpr uint32_t vmem_per_row = row_bytes / sizeof(__uint128_t);
+        constexpr uint32_t rows_per_wg = _WG / vmem_per_row;
+        constexpr uint32_t vmem_per_thread = BIG_TILE_SIZE_N / rows_per_wg;
+        // Make sure WG isn't too large
+        static_assert(vmem_per_thread >= 1);
+
+        const uint8_t* pat = (const uint8_t*)a + tj * row_bytes + ti * BIG_TILE_SIZE_N * stride_n + m * in_stride_nk;
+        #pragma unroll
+        for (uint32_t t = 0; t < vmem_per_thread; t++)
+        {
+            uint32_t col = threadIdx.x % vmem_per_row;
+            uint32_t row = threadIdx.x / vmem_per_row + t * rows_per_wg;
+            uint64_t offset = (col * 8 < max_part_k && row < max_part_n) ?
+                    row * stride_n + col * sizeof(__uint128_t) : 0;
+            const __uint128_t* pfa = (const __uint128_t*)(pat + offset);
+            BLOCK_16B d;
+            d.ow = *pfa;
+            #pragma unroll
+            for (uint32_t i = 0; i < elements_in_16B; i++)
+            {
+                sa[row][col * elements_in_16B + i] = d.e[i];
+            }
+        }
+        __syncthreads();
+        // Copy full tile with large loads
+        constexpr uint32_t row_bytes_out = BIG_TILE_SIZE_N * sizeof(_T);
+        constexpr uint32_t vmem_per_row_out = row_bytes_out / sizeof(__uint128_t);
+        constexpr uint32_t rows_per_wg_out = _WG / vmem_per_row_out; 
+        constexpr uint32_t vmem_per_thread_out = BIG_TILE_SIZE_K / rows_per_wg_out; 
+        // Make sure WG isn't too large
+        static_assert(vmem_per_thread_out >= 1);
+        const uint8_t* pc = (const uint8_t*)c + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_out + m * out_stride_nk;
+        #pragma unroll
+        for (uint32_t t = 0; t < vmem_per_thread_out; t++)
+        {
+            uint32_t col = threadIdx.x % vmem_per_row_out;
+            uint32_t row = threadIdx.x / vmem_per_row_out + t * rows_per_wg_out;
+            if (col * 8 < max_part_n && row < max_part_k)
+            {
+                uint64_t offset = row * stride_k + col * sizeof(__uint128_t);
+                BLOCK_16B d;
+                // Transpose tile on read from LDS
+                #pragma unroll
+                for (uint32_t i = 0; i < elements_in_16B; i++)
+                {
+                    d.e[i] = sa[col * elements_in_16B + i][row];
+                }
+                __uint128_t* pfc = (__uint128_t*)(pc + offset);
+                *pfc = d.ow;
+            }
+        }
+    }
+    else
+    {
+        // Copy partial tiles with element accesses
+        constexpr uint32_t row_bytes = BIG_TILE_SIZE_K * sizeof(_T);
+        constexpr uint32_t vmem_per_row = BIG_TILE_SIZE_K;
+        constexpr uint32_t rows_per_wg = _WG / vmem_per_row;
+        constexpr uint32_t vmem_per_thread = BIG_TILE_SIZE_N / rows_per_wg;
+        // Make sure WG isn't too large
+        static_assert(vmem_per_thread >= 1);
+
+        const uint8_t* pat = (const uint8_t*)a + tj * row_bytes + ti * BIG_TILE_SIZE_N * stride_n + m * in_stride_nk;
+        #pragma unroll
+        for (uint32_t t = 0; t < vmem_per_thread; t++)
+        {
+            uint32_t col = threadIdx.x % vmem_per_row;
+            uint32_t row = threadIdx.x / vmem_per_row + t * rows_per_wg;
+            uint64_t offset = (col < max_part_k && row < max_part_n) ? row * stride_n + col * 2 : 0;
+            const uint16_t* pfa = (const uint16_t*)(pat + offset);
+            sa[row][col] = *pfa;
+        }
+        __syncthreads();
+        // Copy full tile with large loads
+        constexpr uint32_t row_bytes_out = BIG_TILE_SIZE_N * sizeof(_T);
+        constexpr uint32_t vmem_per_row_out = BIG_TILE_SIZE_N;
+        constexpr uint32_t rows_per_wg_out = _WG / vmem_per_row_out;
+        constexpr uint32_t vmem_per_thread_out = BIG_TILE_SIZE_K / rows_per_wg_out;
+        const uint8_t* pc = (const uint8_t*)c + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_out + m * out_stride_nk;
+        #pragma unroll
+        for (uint32_t t = 0; t < vmem_per_thread_out; t++)
+        {
+            uint32_t col = threadIdx.x % vmem_per_row_out;
+            uint32_t row = threadIdx.x / vmem_per_row_out + t * rows_per_wg_out;
+            if (col < max_part_n && row < max_part_k)
+            {
+                uint64_t offset = row * stride_k + col * 2;
+                uint16_t* pfc = (uint16_t*)(pc + offset);
+                *pfc = sa[col][row];
+            }
+        }
+    }
+}
+
+void transpose_last2dim(TensorIteratorBase &iter) {
+  void* dst = iter.data_ptr(0);
+  void* src = iter.data_ptr(1);
+  const auto& input = iter.tensor(1);
+
+  int M = input.size(0);
+  int N = input.size(1);
+  int K = input.size(2);
+
+  auto stream = c10::cuda::getCurrentCUDAStream();
+  constexpr uint32_t BIG_TILE_SIZE_N = 64;
+  constexpr uint32_t BIG_TILE_SIZE_K = 64;
+  int big_tile_wg = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
+  const dim3 grid_dim(big_tile_wg, 1, 1);
+  const dim3 block_dim(256, 1, 1);
+  transpose_tile_big_kernel<uint16_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K><<<grid_dim, block_dim, 0, stream>>>(src, dst, K, N, input.stride(2));
+}
+
 // TODO: We probably can use the opaque type trick to avoid creating duplicate
 // kernels for equivalent bit lengths
 void direct_copy_kernel_cuda(TensorIteratorBase &iter) {
@@ -159,6 +332,8 @@ void direct_copy_kernel_cuda(TensorIteratorBase &iter) {
     });
   } else if (dtype == kFloat8_e5m2 || dtype == kFloat8_e4m3fn || dtype == kFloat8_e5m2fnuz || dtype == kFloat8_e4m3fnuz) {
      float8_copy_kernel_cuda(iter);
+  } else if (is_permute_021(iter) && (dtype == kBFloat16 || dtype == kHalf)) {
+      transpose_last2dim(iter);
   } else if (iter.dtype(1) == kFloat && (dtype == kBFloat16 || dtype == kHalf)) {
      if (dtype == kBFloat16) {
        bfloat16_copy_kernel_cuda(iter);
